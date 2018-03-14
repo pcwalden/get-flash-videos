@@ -3,19 +3,63 @@ package FlashVideo::Site::Itv;
 
 use strict;
 use FlashVideo::Utils;
+use FlashVideo::JSON;
 use HTML::Entities;
+use HTML::TreeBuilder;
+use HTML::Element;
 use Encode;
 use Data::Dumper;
 
-our $VERSION = '0.09';
+our $VERSION = '0.09.03';
 sub Version() { $VERSION;}
+
+sub extract_attributes {
+  my $substr = shift;
+
+  my %attrib;
+  while ($substr =~ m/([-a-z0-9]+)\s*=\"([^\"]+)\"/gi) {
+    $attrib{$1} = $2;
+  }
+  return \%attrib;
+}
 
 sub find_video {
   my ($self, $browser, $page_url, $prefs) = @_;
 
   my($id) = $browser->uri =~ /Filter=(\d+)/;
+
+  
+  my ($itv_param_str) = $browser->content =~ /(\<[^\<]+id="video"[^\>]*\>)/;
+#  info "substring $itv_param_str";
+  my $itv_params = extract_attributes($itv_param_str);
+#  info " test ".$itv_params->{'data-video-autoplay-id'};
+#  info " test ".$itv_params->{'data-video-episode-id'};
+#  info " test ".$itv_params->{'data-playlist-url'};
+
+  my ($og_title) = $browser->content =~ /\<meta\s+property\s*=\s*"og:title"\s+content\s*=\"([^\"]+)\"\>/;
+  
+
+
   my $productionid;
-  if ( $id )
+  ($productionid) = $browser->content =~ /\"productionId\":\"([^\"]+)\"/i;
+  if (! $productionid) {
+    ($productionid) = $browser->content =~ / data-video-id\s*=\s*\"([^\"]+)\"/i;
+  }
+  $productionid =~ s%^.*/%%;
+  $productionid =~ tr%_\.%/#%;
+  debug "Production ID $productionid\n";
+  die "No id (filter) found in URL or production id\n" unless $productionid;
+
+  my $hls_dl= 1;
+  my $rtmp_dl = 1;
+  if ($prefs->{type} =~ /hls/) {
+    $rtmp_dl = 0;
+  }
+  if ($prefs->{type} =~ /rtmp/) {
+    $hls_dl = 0;
+  }
+
+  if ( $id && $rtmp_dl)
   {
 
     $browser->post("http://mercury.itv.com/PlaylistService.svc",
@@ -51,17 +95,10 @@ sub find_video {
 </SOAP-ENV:Envelope>
 EOF
 
+    debug $browser->content;
   }
-  else {
-    ($productionid) = $browser->content =~ /\"productionId\":\"([^\"]+)\"/i;
-    if (! $productionid) {
-      ($productionid) = $browser->content =~ / data-video-id\s*=\s*\"([^\"]+)\"/i;
-    }
-    $productionid =~ s%^.*/%%;
-    $productionid =~ tr%_\.%/#%;
-    debug "Production ID $productionid\n";
-    die "No id (filter) found in URL or production id\n" unless $productionid;
-    $browser->post("http://mercury.itv.com/PlaylistService.svc",
+  elsif ($rtmp_dl) {
+    $browser->post($itv_params->{'data-playlist-url'},
       Content_Type => "text/xml; charset=utf-8",
       Referer      => "http://www.itv.com/mercury/Mercury_VideoPlayer.swf?v=1.5.309/[[DYNAMIC]]/2",
       SOAPAction   => '"http://tempuri.org/PlaylistService/GetPlaylist"',
@@ -108,9 +145,70 @@ EOF
 </soapenv:Envelope>
 EOF
 
+    debug $browser->content;
   }
   # We want the RTMP url within a <Video timecode=...> </Video> section.
-  debug $browser->content;
+
+
+  if ( $hls_dl && (! $rtmp_dl || ($rtmp_dl && 
+        $browser->content =~ m%<faultcode>InvalidEntity</faultcode>%) ) ) {
+
+    debug "Trying IOS download...";
+    debug "Title: $og_title";
+    debug "Episode Title ".$itv_params->{'data-video-episode'};
+    debug "Series: ".$itv_params->{'data-video-title'};
+
+    my $ios_playlist_url = $itv_params->{'data-video-playlist'};
+    my $hmac = $itv_params->{'data-video-hmac'};
+
+    if ( ! defined($ios_playlist_url)) {
+        $ios_playlist_url = $itv_params->{'data-video-id'};
+    }
+
+    debug "ios url: $ios_playlist_url";
+    debug "hamc: $hmac";
+    my $hls_m3u = 'https://127.0.0.1/test.m3u';
+    
+    $browser->agent('Mozilla/5.0 (X11; Linux x86_64; rv:10.0) Gecko/20150101 Firefox/47.0 (Chrome)');
+
+    $browser->post($ios_playlist_url, 
+      Content_Type => 'application/json',
+      Accept       => 'application/vnd.itv.vod.playlist.v2+json',
+      Accept_Encoding => 'gzip, deflate',
+      X_Forwarded_For => '25.166.199.253',
+      hmac => uc($hmac),
+      Content      => '{"user": {"itvUserId": "", "entitlements": [], "token": ""}, "device": {"manufacturer": "Safari", "model": "5", "os": {"name": "Windows NT", "version": "6.1", "type": "desktop"}}, "client": {"version": "4.1", "id": "browser"}, "variantAvailability": {"featureset": {"min": ["hls", "aes", "outband-webvtt"], "max": ["hls", "aes", "outband-webvtt"]}, "platformTag": "dotcom"}}');
+ 
+    debug $browser->content;
+    my $playlist = from_json($browser->content);
+    my $video_id = $playlist->{Playlist}->{Video};
+    my $base_url = $video_id->{Base};
+    my @media_files = @{$video_id->{MediaFiles}};
+
+    debug Data::Dumper::Dumper(@media_files);
+    foreach my $media_file (@media_files) {
+      debug Data::Dumper::Dumper($media_file);
+      $hls_m3u = $base_url . $media_file->{Href};
+    }
+    my $file_id = $productionid;
+    $file_id =~ tr%_/#%---%;
+    my $filename = title_to_filename("$file_id\_$og_title\_hls", "mp4");
+    debug "filename: $filename";
+
+    $browser->cookie_jar( {} ); # keep cookies
+    $browser->add_header( Referer => undef);
+    $browser->delete_header( 'Referer' );
+    $browser->add_header( Accept => 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8');
+    $browser->add_header( Accept_Encoding => 'gzip, deflate');
+    $browser->add_header( Accept_Language => 'en-us,en;q=0.5');
+    $browser->add_header( X_Forwarded_For => '25.166.199.253');
+
+    return {
+      downloader => "hlsx",
+      flv        => $filename,
+      args       => { hls_url => $hls_m3u, prefs => $prefs }
+    };
+  }
   die "Unable to find <Video> in XML" unless $browser->content =~ m{<Video timecode[^>]+>(.*?)</Video>}s;
   my $video = $1;
 
@@ -295,5 +393,77 @@ sub itv_swfhash_data {
     swfUrl  => $url;
 }
 
+sub search {
+  my ($self, $search) = @_;
+
+  my $browser = FlashVideo::Mechanize->new;
+  my @links;
+  my %processed = {};
+
+  $browser->allow_redirects;
+  $search =~ s/\s+/ /g;
+  $search - lc($search);
+
+  $browser->get('https://www.itv.com/hub/shows');
+  
+  my $page = $browser->content;
+  my $series;
+
+  while ($page =~ m%<a href="(https://www.itv.com/hub/([^/]*)[^"]*)"[^>]* data-content-type="programme"[^>]*>%g) {
+    my $showurl = $1;
+    my $prog_name = $2;
+    $prog_name =~ tr/-/ /;
+    next if defined $processed{$showurl};
+
+    if ($prog_name =~ /$search/i) {
+      $browser->get($showurl);
+      my $progpage = $browser->content;
+      my $root = HTML::TreeBuilder->new;
+      # must set otherwise time and section tags are ignored
+      # html5 tags are missing.
+      $root->ignore_unknown(0);
+      $root->parse($progpage);
+       
+      my $episodes = $root->look_down(_tag => 'h2', class => 'episode-info__episode-count');
+      info  ucfirst $prog_name . $episodes->as_text;
+
+      my $prog_title = $root->look_down(_tag => 'h1', class => 'episode-info__programme-title');
+
+      my $episodes = $root->look_down(_tag => 'div', 'id' => 'more-episodes');
+      my @sections = $episodes->look_down(_tag => 'section', class => 'module module--secondary js-series-group');
+      foreach my $section (@sections) {
+#        info $section->attr_get_i('id');
+        my $h2a = $section->look_down(_tag => 'h2', class => 'module__heading');
+        $series = $h2a->as_text;
+        my $li = $section->find('li');
+        my $chan = $li->attr('class');
+        $chan =~ s%^.*--([a-z0-9]+)-pos .*$%$1%;
+
+        my @progs = $section->look_down(_tag => 'a', 'data-content-type' => 'episode');
+
+        foreach my $prog (@progs) {
+          my $url = $prog->attr_get_i('href');
+          my $div = $prog->look_down(_tag => 'div', class => 'tout__body media__body');
+
+          my $h3 = $div->find('h3');
+          my $trans = $div->find('time');
+          my $d = $trans->as_text;
+          $d =~ s/^\s*\w+//;
+          $d =~ s/\s*$//;
+          my $name = $prog_title->as_text . " - $series episode" . $h3->as_text . " - $d ($chan)";
+          my $desc = $div->find('p');
+          my $episode = { name => $name,
+                          url => $url,
+                          description => $desc->as_text};
+
+          push @links, $episode;
+        }
+      }
+    }
+    $processed{$showurl} = $showurl;
+  }
+
+  return @links;
+}
 
 1;

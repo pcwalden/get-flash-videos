@@ -42,6 +42,8 @@ use FlashVideo::Mechanize;
 use FlashVideo::Downloader;
 use FlashVideo::RTMPDownloader;
 use FlashVideo::HLSDownloader;
+use FlashVideo::DASHDownloader;
+use FlashVideo::HLSXDownloader;
 use FlashVideo::Search;
 use FlashVideo::Utils;
 use FlashVideo::VideoPreferences;
@@ -49,7 +51,7 @@ use FlashVideo::VideoPreferences;
 unshift @INC, \&plugin_loader;
 
 # single line for MakeMaker to get version
-use constant CVERSION => "1.25.94"; our $VERSION = CVERSION;
+use constant CVERSION => "1.25.99"; our $VERSION = CVERSION;
  
 our %opt;
 BEGIN {
@@ -81,6 +83,8 @@ BEGIN {
     debug => 0,
     quiet => 0,
     quality => "high",
+    raw => 1,
+    type => '',
     subtitles => 0,
     info => 0
   );
@@ -109,6 +113,8 @@ Options:
      --subtitles  Download subtitles where available.
   -q --quiet      Be quiet (only print errors).
   -r --quality    Quality to download at (high|medium|low, or site specific).
+     --raw        No audio cleanup for hls.
+  -t --type       Download type HLS/RTMP only download given type.
   -v --version    Print version.
   -y --yes        Say yes to any questions (don't prompt for any information).
   -i --info       Print out info about video instead of downloading.
@@ -148,6 +154,8 @@ GetOptions(
   "quiet|q"      => \$opt{quiet},
   "add-plugin=s" => \$opt{add_plugin},
   "quality|r=s"  => \$opt{quality},
+  "raw"          => \$opt{raw},
+  "type|t=s"     => \$opt{type},
   "subtitles"    => \$opt{subtitles},
   "info|i"       => \$opt{info},
 ) or die "Try $0 --help for more information.\n";
@@ -406,6 +414,10 @@ sub download {
     if(ref $data eq 'HASH') {
       if (defined($data->{downloader}) && $data->{downloader} eq "hls") {
         $downloader = FlashVideo::HLSDownloader->new;
+      } elsif (defined($data->{downloader}) && $data->{downloader} eq "hlsx") {
+        $downloader = FlashVideo::HLSXDownloader->new;
+      } elsif (defined($data->{downloader}) && $data->{downloader} eq "dash") {
+        $downloader = FlashVideo::DASHDownloader->new;
       } else {
         # RTMP data
         $downloader = FlashVideo::RTMPDownloader->new;
